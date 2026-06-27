@@ -30,6 +30,10 @@ Available models: `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5-2025
 
 Spawns `claude -p <prompt> --output-format stream-json` as a subprocess and pipes the streaming events into pi. Tool calls (Bash, Read, Edit, etc.) are executed by the claude subprocess and shown as `▶ ToolName: ...` lines in the pi stream.
 
+## Acknowledgements
+
+Initial version vibe coded with [Claude Code](https://claude.ai/code).
+
 ## License
 
 MIT
