@@ -13,6 +13,9 @@
  */
 
 import { spawn } from "child_process";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 import type {
   Api,
   AssistantMessage,
@@ -25,6 +28,7 @@ import type {
   ThinkingContent,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const CLAUDE_BIN = "/opt/homebrew/bin/claude";
@@ -307,6 +311,101 @@ function streamClaudeCLI(
   return stream;
 }
 
+// Basic companion commands mirroring Claude Code's own /compact, /resume and
+// /memory, adapted to this wrapper. This provider spawns `claude -p` fresh each
+// turn (no persistent claude session), so these operate on pi's session and on
+// Claude's on-disk memory (CLAUDE.md) rather than a live claude session id.
+function registerCliCommands(pi: ExtensionAPI): void {
+  // /compact — summarize the conversation to reclaim context. Optional args are
+  // passed as focus instructions to the summarizer. Delegates to pi's own
+  // compaction (which shrinks the history this provider replays each turn).
+  pi.registerCommand("compact", {
+    description: "Compact the conversation to free context (optional: /compact <focus>)",
+    handler: async (args, ctx) => {
+      const focus = args.trim();
+      const before = ctx.getContextUsage()?.tokens;
+      ctx.compact({
+        customInstructions: focus || undefined,
+        onComplete: () => {
+          ctx.ui.notify(
+            before != null
+              ? `Compacted conversation (was ~${before.toLocaleString()} tokens)`
+              : "Compacted conversation",
+            "info",
+          );
+        },
+        onError: (e) => ctx.ui.notify(`Compaction failed: ${e.message}`, "error"),
+      });
+    },
+  });
+
+  // /resume — pick a previous pi session in this directory and switch to it.
+  pi.registerCommand("resume", {
+    description: "Resume a previous session in this directory",
+    handler: async (_args, ctx) => {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("/resume needs an interactive session", "warning");
+        return;
+      }
+      const current = ctx.sessionManager.getSessionFile();
+      const sessions = (await SessionManager.list(ctx.cwd))
+        .filter((s) => s.path !== current)
+        .sort((a, b) => b.modified.getTime() - a.modified.getTime());
+      if (sessions.length === 0) {
+        ctx.ui.notify("No other sessions to resume in this directory", "info");
+        return;
+      }
+      const labels = sessions.map((s, i) => {
+        const title = (s.name || s.firstMessage || "(empty session)").replace(/\s+/g, " ").slice(0, 60);
+        return `${i + 1}. ${title} — ${s.messageCount} msg, ${s.modified.toLocaleString()}`;
+      });
+      const picked = await ctx.ui.select("Resume session:", labels);
+      if (!picked) return;
+      const idx = labels.indexOf(picked);
+      if (idx < 0) return;
+      await ctx.switchSession(sessions[idx].path, {
+        withSession: async (c) => c.ui.notify("Resumed session", "info"),
+      });
+    },
+  });
+
+  // /memory — view/edit Claude's memory (CLAUDE.md). With text, quick-adds a
+  // bullet to the project file (like Claude Code's `#` shortcut); with no args,
+  // opens a chosen memory file in the editor and saves edits back.
+  pi.registerCommand("memory", {
+    description: "Add a memory line (/memory <text>) or edit CLAUDE.md memory files",
+    handler: async (args, ctx) => {
+      const projectMem = join(ctx.cwd, "CLAUDE.md");
+      const userMem = join(homedir(), ".claude", "CLAUDE.md");
+
+      const text = args.trim();
+      if (text) {
+        const bullet = text.startsWith("-") ? text : `- ${text}`;
+        const header = existsSync(projectMem) ? "" : "# Project memory\n\n";
+        appendFileSync(projectMem, `${header}${bullet}\n`);
+        ctx.ui.notify(`Added to ${projectMem}`, "info");
+        return;
+      }
+
+      if (!ctx.hasUI) {
+        ctx.ui.notify("/memory needs an interactive session (or use /memory <text>)", "warning");
+        return;
+      }
+      const target = await ctx.ui.select("Edit which memory file?", [
+        `Project — ${projectMem}`,
+        `User — ${userMem}`,
+      ]);
+      if (!target) return;
+      const path = target.startsWith("Project") ? projectMem : userMem;
+      const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
+      const edited = await ctx.ui.editor(`Edit ${path}`, existing);
+      if (edited == null || edited === existing) return;
+      writeFileSync(path, edited);
+      ctx.ui.notify(`Saved ${path}`, "info");
+    },
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerProvider("claude-cli", {
     baseUrl: "https://api.anthropic.com",
@@ -345,4 +444,6 @@ export default function (pi: ExtensionAPI) {
 
     streamSimple: streamClaudeCLI,
   });
+
+  registerCliCommands(pi);
 }
