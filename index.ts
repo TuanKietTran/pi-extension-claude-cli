@@ -315,6 +315,15 @@ export default function (pi: ExtensionAPI) {
 
     models: [
       {
+        id: "claude-fable-5",
+        name: "Claude Fable 5 (CLI)",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200000,
+        maxTokens: 64000,
+      },
+      {
         id: "claude-opus-4-8",
         name: "Claude Opus 4.8 (CLI)",
         reasoning: true,
@@ -322,6 +331,15 @@ export default function (pi: ExtensionAPI) {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 32000,
+      },
+      {
+        id: "claude-sonnet-5",
+        name: "Claude Sonnet 5 (CLI)",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200000,
+        maxTokens: 64000,
       },
       {
         id: "claude-sonnet-4-6",
