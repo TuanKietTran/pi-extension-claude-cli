@@ -33,6 +33,55 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const CLAUDE_BIN = "/opt/homebrew/bin/claude";
 
+// Appended to the system prompt only when a browser server is attached.
+// Drives the token-efficient, "humanized tester" behavior both browser MCPs
+// make possible: semantic accessibility snapshots + stable element refs/uids
+// instead of expensive screenshots and pixel-guessing. Engine-neutral — the
+// chrome-devtools and firefox-devtools servers share the same tool concepts
+// (take_snapshot, click/fill by ref, evaluate_script, console/network lists).
+// See README for the why/measurements.
+function browserSystemPrompt(engineLabel: string): string {
+  return `You are driving a REAL browser — ${engineLabel} — through its accessibility-snapshot MCP tools. Work token-efficiently and behave like a careful human tester.
+
+STARTUP
+- The browser server can take 10-30s to become ready on first use (it launches a real browser). If a browser tool isn't available yet or returns a "still connecting"/not-ready error, WAIT briefly and retry the SAME browser tool. Do NOT fall back to WebFetch/Bash to fetch the page — those defeat the purpose; the task requires the live browser.
+
+OBSERVE
+- Default to take_snapshot: the accessibility tree with stable element refs/uids. It is ~10-20x cheaper than a screenshot and the refs are what you act on.
+- Do NOT re-snapshot a page that has not changed. Reuse the refs you already have; snapshot again only after a navigation or a DOM-changing action.
+- To read specific data (text, values, attributes, computed styles, counts), call evaluate_script with a tiny JS expression that returns ONLY the value you need. Never screenshot just to "read" a page.
+- Use the console and network listing tools to catch errors instead of inferring them visually.
+
+ACT
+- Interact by ref/uid (click / fill / hover the element from the latest snapshot). Never guess pixel coordinates.
+- After an action, wait for navigation/network to settle before the next snapshot.
+- Move like a human: one logical step at a time, fill forms field-by-field, follow visible affordances, don't hammer the same control.
+
+SCREENSHOT — sparingly
+- Take a screenshot ONLY when the task is inherently visual: layout/CSS/rendering bugs, canvas/WebGL/image content, or when the accessibility tree is missing or insufficient. Otherwise prefer snapshot + evaluate_script.
+
+REPORTING (for smoke / regression / bug-bounty work)
+- Smoke & regression: navigate, assert key elements exist via snapshot, check console + network for errors, return a clear PASS/FAIL with the evidence (ref, value, console line, or failed request).
+- UI / visual bug bounty: cross-check snapshot semantics against the rendered screenshot; flag mismatches, overlapping or cut-off elements, broken/empty states, console errors, and failed requests.
+- Always be concise: what you did, what you observed (with concrete evidence), and the verdict.`;
+}
+
+// Resolve a Gecko (Firefox/Zen) binary for the firefox-devtools MCP. Honors an
+// explicit override, else probes the common macOS install locations — Zen first
+// since that's a Firefox fork the user runs.
+function resolveFirefoxPath(): string | undefined {
+  if (process.env.CLAUDE_CLI_FIREFOX_PATH) return process.env.CLAUDE_CLI_FIREFOX_PATH;
+  const home = process.env.HOME ?? "";
+  const candidates = [
+    "/Applications/Zen.app/Contents/MacOS/zen",
+    `${home}/Applications/Zen.app/Contents/MacOS/zen`,
+    "/Applications/Firefox.app/Contents/MacOS/firefox",
+    "/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox",
+    "/Applications/Firefox Nightly.app/Contents/MacOS/firefox",
+  ];
+  return candidates.find((p) => existsSync(p));
+}
+
 function buildHistory(messages: Message[]): string {
   const parts: string[] = [];
   for (const msg of messages) {
@@ -69,6 +118,20 @@ function formatToolCall(name: string, inputJson: string): string {
     }
     if (name === "WebFetch" && input.url) {
       return `▶ WebFetch: ${input.url}\n\n`;
+    }
+    if (name === "WebSearch" && input.query) {
+      return `▶ WebSearch: ${input.query}\n\n`;
+    }
+    if (name === "ToolSearch" && input.query) {
+      return `▶ ToolSearch: ${input.query}\n\n`;
+    }
+    // MCP tools (e.g. browser via chrome-devtools): "mcp__<server>__<tool>"
+    if (name.startsWith("mcp__")) {
+      const parts = name.slice(5).split("__");
+      const tool = parts.slice(1).join("__") || parts[0];
+      const arg = Object.values(input)[0];
+      const detail = arg != null ? `: ${String(arg).slice(0, 120)}` : "";
+      return `▶ ${tool}${detail}\n\n`;
     }
     // Fallback: show first param
     const first = Object.entries(input)[0];
@@ -138,11 +201,138 @@ function streamClaudeCLI(
         // NOTE: --tools "" removed — was causing claude to hallucinate fake
         // tool calls as text since it expected tools but had none available
       ];
+
+      // Child env; browser block may raise the MCP startup timeout below.
+      const childEnv: NodeJS.ProcessEnv = { ...process.env };
+
+      // Tools that must be explicitly granted in -p (print) mode. Bash/Read/
+      // Edit/etc. are already permitted by the user's local claude settings;
+      // these server-side web tools are denied unless allowed here (there's no
+      // interactive prompt to grant them). Pushed as ONE comma-separated flag —
+      // a repeated --allowedTools could override rather than merge.
+      const allowedTools = ["WebSearch", "WebFetch"];
+
+      // Opt-in browser interaction. Set CLAUDE_CLI_BROWSER=1 to attach a browser
+      // MCP server that drives a REAL browser via accessibility snapshots — far
+      // more token-efficient than playwright/full-DOM tools (snapshot ~200-400
+      // tok vs screenshot ~4-5k) because browserSystemPrompt biases the model to
+      // semantic snapshots + ref-based actions. Two engines, same token model:
+      //   chrome  -> chrome-devtools-mcp over CDP (Chrome / Chromium)
+      //   firefox -> @mozilla/firefox-devtools-mcp over WebDriver BiDi/Marionette
+      //              (Firefox AND Gecko forks like Zen)
+      // Pick via CLAUDE_CLI_BROWSER_ENGINE=chrome|firefox (aliases: zen, gecko,
+      // mozilla, ff -> firefox; chromium -> chrome). If unset, auto-detects
+      // firefox when a Zen/Firefox binary is present and no CDP url is given,
+      // else chrome. Off by default so ordinary prompts don't spawn a browser.
+      // Done before the system prompt is consumed below so guidance is included.
+      if (process.env.CLAUDE_CLI_BROWSER) {
+        let engine = (process.env.CLAUDE_CLI_BROWSER_ENGINE ?? "").toLowerCase();
+        if (["zen", "gecko", "mozilla", "ff", "firefox"].includes(engine)) engine = "firefox";
+        if (["chrome", "chromium"].includes(engine)) engine = "chrome";
+        const firefoxPath = resolveFirefoxPath();
+        if (!engine) {
+          // A CDP url implies Chrome; otherwise prefer an installed Gecko.
+          engine = process.env.CLAUDE_CLI_BROWSER_URL ? "chrome" : firefoxPath ? "firefox" : "chrome";
+        }
+
+        let mcpConfig: string;
+        let allowTool: string;
+        let engineLabel: string;
+
+        if (process.env.CLAUDE_CLI_BROWSER_CONFIG) {
+          // User-supplied config (full override). Allow the matching wildcard.
+          mcpConfig = process.env.CLAUDE_CLI_BROWSER_CONFIG;
+          allowTool = engine === "firefox" ? "mcp__firefox-devtools" : "mcp__chrome-devtools";
+          engineLabel = engine === "firefox" ? "Firefox/Zen (Gecko)" : "Chrome";
+        } else if (engine === "firefox") {
+          const ffArgs = [
+            "-y", "@mozilla/firefox-devtools-mcp@latest",
+            // evaluate_script is gated behind this flag (Firefox 153+); we depend
+            // on it for cheap data extraction instead of screenshots. On older
+            // Gecko it's simply a no-op — the model falls back to snapshots.
+            "--enableScript",
+          ];
+          if (firefoxPath) ffArgs.push("--firefoxPath", firefoxPath);
+          // Reuse the user's logged-in profile for a "humanized" session.
+          if (process.env.CLAUDE_CLI_BROWSER_PROFILE)
+            ffArgs.push("--profilePath", process.env.CLAUDE_CLI_BROWSER_PROFILE);
+          // Attach to an already-running Firefox/Zen launched with `--marionette`
+          // instead of spawning one. Note: BiDi-only features (console/network
+          // events) are unavailable in connect-existing mode.
+          if (process.env.CLAUDE_CLI_BROWSER_CONNECT) {
+            ffArgs.push("--connectExisting");
+            if (process.env.CLAUDE_CLI_MARIONETTE_PORT)
+              ffArgs.push("--marionettePort", process.env.CLAUDE_CLI_MARIONETTE_PORT);
+          } else {
+            // Only when WE launch the browser: suppress the first-run / welcome /
+            // "what's new" tabs. On a fresh (or freshly-updated) Gecko profile
+            // these open an extra onboarding tab that pollutes the first snapshot
+            // and can intercept the first navigation/click. Gecko has no
+            // --no-first-run CLI flag, so we set the equivalent prefs via
+            // moz:firefoxOptions (--pref). Applied per-launch; the user's real
+            // profile is untouched. Extra prefs can be appended (newline- or
+            // comma-separated name=value) via CLAUDE_CLI_BROWSER_PREFS.
+            const prefs = [
+              "browser.aboutwelcome.enabled=false",
+              "browser.startup.homepage_override.mstone=ignore",
+              "browser.messaging-system.whatsNewPanel.enabled=false",
+              "startup.homepage_welcome_url=about:blank",
+              "startup.homepage_welcome_url.additional=about:blank",
+              "trailhead.firstrun.didSeeAboutWelcome=true",
+              "datareporting.policy.firstRunURL=",
+            ];
+            if (process.env.CLAUDE_CLI_BROWSER_PREFS)
+              prefs.push(...process.env.CLAUDE_CLI_BROWSER_PREFS.split(/[\n,]+/));
+            for (const p of prefs) {
+              const pref = p.trim();
+              if (pref) ffArgs.push("--pref", pref);
+            }
+          }
+          mcpConfig = JSON.stringify({
+            mcpServers: { "firefox-devtools": { command: "npx", args: ffArgs } },
+          });
+          allowTool = "mcp__firefox-devtools";
+          engineLabel = firefoxPath?.includes("zen") ? "Zen (Firefox/Gecko)" : "Firefox (Gecko)";
+        } else {
+          const cdpArgs = [
+            "-y", "chrome-devtools-mcp@latest",
+            // Make the *rare* screenshot cheap: webp is ~3-5x smaller than png.
+            "--screenshotFormat", "webp",
+            "--screenshotQuality", "60",
+            "--screenshotMaxWidth", "1280",
+          ];
+          // Attach to an already-running Chrome (real session, logins, cookies)
+          // when CLAUDE_CLI_BROWSER_URL points at a remote-debugging endpoint,
+          // e.g. http://127.0.0.1:9222 — start Chrome with
+          // --remote-debugging-port=9222. Otherwise a dedicated (non-headless,
+          // still real) Chrome profile is launched automatically.
+          if (process.env.CLAUDE_CLI_BROWSER_URL)
+            cdpArgs.push("--browserUrl", process.env.CLAUDE_CLI_BROWSER_URL);
+          mcpConfig = JSON.stringify({
+            mcpServers: { "chrome-devtools": { command: "npx", args: cdpArgs } },
+          });
+          allowTool = "mcp__chrome-devtools";
+          engineLabel = "Chrome";
+        }
+
+        // --mcp-config accepts a JSON string, not just a file path.
+        args.push("--mcp-config", mcpConfig);
+        // Allow every tool from the browser server (mcp__<server> wildcard).
+        allowedTools.push(allowTool);
+        appendParts.push(browserSystemPrompt(engineLabel));
+        // Cold start launches a real browser (~10-30s for Zen/Firefox); the
+        // default MCP startup timeout can mark the server failed before it's
+        // ready. Give it room (honored by claude as MCP_TIMEOUT, in ms).
+        if (!childEnv.MCP_TIMEOUT) childEnv.MCP_TIMEOUT = "60000";
+      }
+
       if (appendParts.length > 0) {
         args.push("--append-system-prompt", appendParts.join("\n\n"));
       }
 
-      const proc = spawn(CLAUDE_BIN, args, { env: { ...process.env } });
+      args.push("--allowedTools", allowedTools.join(","));
+
+      const proc = spawn(CLAUDE_BIN, args, { env: childEnv });
 
       stream.push({ type: "start", partial: output });
 
