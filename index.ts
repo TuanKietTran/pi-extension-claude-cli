@@ -423,6 +423,15 @@ export default function (pi: ExtensionAPI) {
         maxTokens: 64000,
       },
       {
+        id: "claude-opus-5",
+        name: "Claude Opus 5 (CLI)",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1000000,
+        maxTokens: 128000,
+      },
+      {
         id: "claude-opus-4-8",
         name: "Claude Opus 4.8 (CLI)",
         reasoning: true,
