@@ -146,6 +146,9 @@ function streamClaudeCLI(
         "--verbose",
         "--model", model.id,
         "--add-dir", cwd,
+        // Non-interactive: there's no TTY to answer permission prompts, so
+        // without this any tool call needing approval blocks forever.
+        "--dangerously-skip-permissions",
         // NOTE: --tools "" removed — was causing claude to hallucinate fake
         // tool calls as text since it expected tools but had none available
       ];
