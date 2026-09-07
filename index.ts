@@ -30,7 +30,19 @@ import type {
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const CLAUDE_BIN = "/opt/homebrew/bin/claude";
+function resolveClaudeBin(): string {
+  const candidates = [
+    join(homedir(), ".local", "bin", "claude"),
+    "/opt/homebrew/bin/claude",
+    "/usr/local/bin/claude",
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return "claude"; // fall back to PATH lookup
+}
+
+const CLAUDE_BIN = resolveClaudeBin();
 
 function buildHistory(messages: Message[]): string {
   const parts: string[] = [];
