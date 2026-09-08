@@ -4,16 +4,15 @@
  * Wraps the local `claude` binary as a pi provider. Auth comes from
  * whatever `claude` is already logged in as — no separate API key needed.
  *
- * Fixes vs original:
- *  - Removed --tools "" (was causing hallucinated fake tool calls in text)
- *  - Changed --system-prompt to --append-system-prompt (preserves claude's
- *    default system prompt + tool descriptions)
- *  - Added --add-dir so claude can access the working directory
- *  - tool_use blocks are now rendered as visible ▶ Tool lines in the stream
+ * Pi owns tool execution: Claude's native tools are disabled, active Pi tool
+ * schemas are supplied through a structured-output bridge, and requested calls
+ * are emitted as real pi ToolCall blocks. This preserves Pi's tool allowlists,
+ * lifecycle events, validation, and result handling.
  */
 
 import { spawn } from "child_process";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "fs";
+import { randomUUID } from "crypto";
 import { homedir } from "os";
 import { join } from "path";
 import type {
@@ -24,8 +23,9 @@ import type {
   Message,
   Model,
   SimpleStreamOptions,
-  TextContent,
   ThinkingContent,
+  Tool,
+  ToolCall,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -44,50 +44,121 @@ function resolveClaudeBin(): string {
 
 const CLAUDE_BIN = resolveClaudeBin();
 
-function buildHistory(messages: Message[]): string {
-  const parts: string[] = [];
-  for (const msg of messages) {
-    if (msg.role === "user") {
-      const text =
-        typeof msg.content === "string"
-          ? msg.content
-          : (msg.content as any[])
-              .map((c) => (c.type === "text" ? c.text : "[image]"))
-              .join("\n");
-      parts.push(`Human: ${text}`);
-    } else if (msg.role === "assistant") {
-      const text = (msg.content as any[])
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join("\n");
-      if (text.trim()) parts.push(`Assistant: ${text}`);
-    }
-  }
-  return parts.join("\n\n");
+function contentText(content: Message["content"]): string {
+  if (typeof content === "string") return content;
+  return content
+    .map((block: any) => block.type === "text" ? block.text : "[image]")
+    .join("\n");
 }
 
-function formatToolCall(name: string, inputJson: string): string {
-  try {
-    const input = JSON.parse(inputJson || "{}");
-    if (name === "Bash" && input.command) {
-      return `▶ Bash: \`${input.command}\`\n\n`;
-    }
-    if ((name === "Read" || name === "Write" || name === "Edit") && input.file_path) {
-      return `▶ ${name}: ${input.file_path}\n\n`;
-    }
-    if (name === "Glob" && input.pattern) {
-      return `▶ Glob: ${input.pattern}\n\n`;
-    }
-    if (name === "WebFetch" && input.url) {
-      return `▶ WebFetch: ${input.url}\n\n`;
-    }
-    // Fallback: show first param
-    const first = Object.entries(input)[0];
-    if (first) return `▶ ${name}: ${String(first[1]).slice(0, 120)}\n\n`;
-    return `▶ ${name}\n\n`;
-  } catch {
-    return `▶ ${name}\n\n`;
+function formatMessage(message: Message): string {
+  if (message.role === "user") return `Human: ${contentText(message.content)}`;
+
+  if (message.role === "toolResult") {
+    const status = message.isError ? "error" : "success";
+    return `Tool result (${status}) for ${message.toolName} [${message.toolCallId}]:\n${contentText(message.content)}`;
   }
+
+  const blocks = message.content.flatMap((block) => {
+    if (block.type === "text") return block.text.trim() ? [block.text] : [];
+    if (block.type === "toolCall") {
+      return [`Tool call [${block.id}]: ${block.name}(${JSON.stringify(block.arguments)})`];
+    }
+    return [];
+  });
+  return `Assistant: ${blocks.join("\n")}`;
+}
+
+function buildHistory(messages: Message[]): string {
+  return messages.map(formatMessage).filter((part) => part.trim()).join("\n\n");
+}
+
+function createOutputSchema(tools: Tool[]): Record<string, unknown> {
+  const toolCallItems: Record<string, unknown> = {
+    type: "object",
+    properties: {
+      name: tools.length > 0
+        ? { type: "string", enum: tools.map((tool) => tool.name) }
+        : { type: "string" },
+      arguments: { type: "object" },
+    },
+    required: ["name", "arguments"],
+    additionalProperties: false,
+  };
+
+  return {
+    type: "object",
+    properties: {
+      text: { type: "string" },
+      tool_calls: {
+        type: "array",
+        items: toolCallItems,
+        ...(tools.length === 0 ? { maxItems: 0 } : {}),
+      },
+    },
+    required: ["text", "tool_calls"],
+    additionalProperties: false,
+  };
+}
+
+function createToolBridgePrompt(tools: Tool[]): string {
+  if (tools.length === 0) {
+    return [
+      "<pi_tool_bridge>",
+      "No host tools are active. Return an empty tool_calls array and put the answer in text.",
+      "</pi_tool_bridge>",
+    ].join("\n");
+  }
+
+  const definitions = tools.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+  }));
+
+  return [
+    "<pi_tool_bridge>",
+    "Claude's native tools are disabled. The following tools are provided by the Pi host.",
+    "To call them, return each requested call in tool_calls. Pi executes them after this response and supplies the results in the next turn.",
+    "Do not claim these host tools are unavailable. Do not simulate a tool call in prose.",
+    "When one or more tools are needed, keep text brief and populate tool_calls with exact tool names and schema-valid arguments.",
+    "When no tool is needed, return an empty tool_calls array and put the final answer in text.",
+    JSON.stringify(definitions),
+    "</pi_tool_bridge>",
+  ].join("\n");
+}
+
+function parseStructuredOutput(value: unknown, tools: Tool[]): { text: string; toolCalls: ToolCall[] } {
+  if (!value || typeof value !== "object") {
+    throw new Error("claude CLI did not return structured output");
+  }
+
+  const candidate = value as { text?: unknown; tool_calls?: unknown };
+  if (typeof candidate.text !== "string" || !Array.isArray(candidate.tool_calls)) {
+    throw new Error("claude CLI returned invalid structured output");
+  }
+
+  const activeNames = new Set(tools.map((tool) => tool.name));
+  const toolCalls = candidate.tool_calls.map((raw, index) => {
+    if (!raw || typeof raw !== "object") {
+      throw new Error(`claude CLI returned an invalid tool call at index ${index}`);
+    }
+    const call = raw as { name?: unknown; arguments?: unknown };
+    if (typeof call.name !== "string" || !activeNames.has(call.name)) {
+      throw new Error(`claude CLI requested inactive tool: ${String(call.name)}`);
+    }
+    if (!call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments)) {
+      throw new Error(`claude CLI returned invalid arguments for tool: ${call.name}`);
+    }
+    return {
+      type: "toolCall" as const,
+      id: `claude_cli_${randomUUID()}`,
+      name: call.name,
+      arguments: call.arguments as Record<string, unknown>,
+    };
+  });
+
+  return { text: candidate.text, toolCalls };
 }
 
 function streamClaudeCLI(
@@ -112,64 +183,54 @@ function streamClaudeCLI(
         totalTokens: 0,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
-      stopReason: "stop",
+      stopReason: "pending",
       timestamp: Date.now(),
     };
 
     try {
+      const tools = context.tools ?? [];
       const messages = context.messages;
       const lastMsg = messages[messages.length - 1];
+      if (!lastMsg) throw new Error("claude CLI received an empty context");
+
+      const prompt = formatMessage(lastMsg);
       const history = messages.slice(0, -1);
-
-      const prompt =
-        typeof lastMsg.content === "string"
-          ? lastMsg.content
-          : (lastMsg.content as any[])
-              .map((c) => (c.type === "text" ? c.text : "[image]"))
-              .join("\n");
-
-      // Use --append-system-prompt so we add to claude's default system prompt
-      // (tool descriptions, CLAUDE.md discovery) rather than replacing it
       const appendParts: string[] = [];
       if (context.systemPrompt) appendParts.push(context.systemPrompt);
+      appendParts.push(createToolBridgePrompt(tools));
       if (history.length > 0) {
         appendParts.push(
           `<conversation_history>\n${buildHistory(history)}\n</conversation_history>`,
         );
       }
 
-      const cwd = process.cwd();
       const args = [
         "-p", prompt,
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--verbose",
         "--model", model.id,
-        "--add-dir", cwd,
-        // Non-interactive: there's no TTY to answer permission prompts, so
-        // without this any tool call needing approval blocks forever.
-        "--dangerously-skip-permissions",
-        // NOTE: --tools "" removed — was causing claude to hallucinate fake
-        // tool calls as text since it expected tools but had none available
+        "--safe-mode",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--mcp-config", JSON.stringify({ mcpServers: {} }),
+        "--tools", "",
+        "--no-session-persistence",
+        "--json-schema", JSON.stringify(createOutputSchema(tools)),
+        "--append-system-prompt", appendParts.join("\n\n"),
       ];
-      if (appendParts.length > 0) {
-        args.push("--append-system-prompt", appendParts.join("\n\n"));
+      if (options?.reasoning) {
+        args.push("--effort", options.reasoning === "minimal" ? "low" : options.reasoning);
       }
 
       const proc = spawn(CLAUDE_BIN, args, { env: { ...process.env } });
 
       stream.push({ type: "start", partial: output });
 
-      // Internal block tracking — tool_use blocks are tracked but stored as
-      // TextContent so we can render them as visible ▶ lines in the pi stream
-      type TrackedBlock = (ThinkingContent | TextContent) & {
-        _idx: number;
-        _isToolCall?: boolean;
-        _toolName?: string;
-        _inputJson?: string;
-      };
-      const blocks: TrackedBlock[] = [];
-
+      type TrackedThinking = ThinkingContent & { _idx: number };
+      const blocks: TrackedThinking[] = [];
+      let structuredOutput: unknown;
+      let resultError: string | undefined;
       let buf = "";
       let stderrBuf = "";
 
@@ -192,87 +253,35 @@ function streamClaudeCLI(
               output.usage.cacheRead = u.cache_read_input_tokens ?? 0;
               output.usage.cacheWrite = u.cache_creation_input_tokens ?? 0;
 
-            } else if (e.type === "content_block_start") {
-              if (e.content_block.type === "text") {
-                const block = { type: "text" as const, text: "", _idx: e.index } as TrackedBlock;
-                output.content.push(block as any);
-                blocks.push(block);
-                stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
-
-              } else if (e.content_block.type === "thinking") {
-                const block = {
-                  type: "thinking" as const,
-                  thinking: "",
-                  thinkingSignature: "",
-                  _idx: e.index,
-                } as TrackedBlock;
-                output.content.push(block as any);
-                blocks.push(block);
-                stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
-
-              } else if (e.content_block.type === "tool_use") {
-                // Stored as a text block; rendered as "▶ ToolName: ..." once input is complete
-                const block = {
-                  type: "text" as const,
-                  text: "",
-                  _idx: e.index,
-                  _isToolCall: true,
-                  _toolName: e.content_block.name,
-                  _inputJson: "",
-                } as TrackedBlock;
-                output.content.push(block as any);
-                blocks.push(block);
-                // defer text_start until we have the full input to format
-              }
+            } else if (e.type === "content_block_start" && e.content_block.type === "thinking") {
+              const block = {
+                type: "thinking" as const,
+                thinking: "",
+                thinkingSignature: "",
+                _idx: e.index,
+              } as TrackedThinking;
+              output.content.push(block as any);
+              blocks.push(block);
+              stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
 
             } else if (e.type === "content_block_delta") {
-              const bi = blocks.findIndex((b) => b._idx === e.index);
-              if (bi === -1) continue;
-              const block = blocks[bi];
-              const ci = output.content.indexOf(block as any);
+              const block = blocks.find((candidate) => candidate._idx === e.index);
+              if (!block) continue;
+              const contentIndex = output.content.indexOf(block as any);
 
-              if (e.delta.type === "text_delta" && block.type === "text" && !block._isToolCall) {
-                (block as any).text += e.delta.text;
-                stream.push({ type: "text_delta", contentIndex: ci, delta: e.delta.text, partial: output });
-
-              } else if (e.delta.type === "thinking_delta" && block.type === "thinking") {
-                (block as any).thinking += e.delta.thinking;
-                stream.push({ type: "thinking_delta", contentIndex: ci, delta: e.delta.thinking, partial: output });
-
-              } else if (e.delta.type === "signature_delta" && block.type === "thinking") {
-                (block as any).thinkingSignature =
-                  ((block as any).thinkingSignature ?? "") + e.delta.signature;
-
-              } else if (e.delta.type === "input_json_delta" && block._isToolCall) {
-                block._inputJson = (block._inputJson ?? "") + e.delta.partial_json;
+              if (e.delta.type === "thinking_delta") {
+                block.thinking += e.delta.thinking;
+                stream.push({ type: "thinking_delta", contentIndex, delta: e.delta.thinking, partial: output });
+              } else if (e.delta.type === "signature_delta") {
+                block.thinkingSignature = (block.thinkingSignature ?? "") + e.delta.signature;
               }
 
             } else if (e.type === "content_block_stop") {
-              const bi = blocks.findIndex((b) => b._idx === e.index);
-              if (bi === -1) continue;
-              const block = blocks[bi];
-              const ci = output.content.indexOf(block as any);
+              const block = blocks.find((candidate) => candidate._idx === e.index);
+              if (!block) continue;
+              const contentIndex = output.content.indexOf(block as any);
               delete (block as any)._idx;
-
-              if (block._isToolCall) {
-                const formatted = formatToolCall(
-                  block._toolName ?? "tool",
-                  block._inputJson ?? "",
-                );
-                (block as any).text = formatted;
-                // Emit start → delta → end now that we have the full formatted line
-                stream.push({ type: "text_start", contentIndex: ci, partial: output });
-                stream.push({ type: "text_delta", contentIndex: ci, delta: formatted, partial: output });
-                stream.push({ type: "text_end", contentIndex: ci, content: formatted, partial: output });
-                delete (block as any)._isToolCall;
-                delete (block as any)._toolName;
-                delete (block as any)._inputJson;
-
-              } else if (block.type === "text") {
-                stream.push({ type: "text_end", contentIndex: ci, content: (block as any).text, partial: output });
-              } else if (block.type === "thinking") {
-                stream.push({ type: "thinking_end", contentIndex: ci, content: (block as any).thinking, partial: output });
-              }
+              stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
 
             } else if (e.type === "message_delta" && e.usage) {
               output.usage.output = e.usage.output_tokens ?? 0;
@@ -282,8 +291,21 @@ function streamClaudeCLI(
             }
 
           } else if (ev.type === "result") {
+            structuredOutput = ev.structured_output;
             if (ev.total_cost_usd != null) output.usage.cost.total = ev.total_cost_usd;
-            if (ev.subtype === "error") throw new Error(ev.error ?? "claude CLI error");
+            if (ev.usage) {
+              output.usage.input = ev.usage.input_tokens ?? output.usage.input;
+              output.usage.output = ev.usage.output_tokens ?? output.usage.output;
+              output.usage.cacheRead = ev.usage.cache_read_input_tokens ?? output.usage.cacheRead;
+              output.usage.cacheWrite = ev.usage.cache_creation_input_tokens ?? output.usage.cacheWrite;
+              output.usage.reasoning = ev.usage.output_tokens_details?.thinking_tokens;
+              output.usage.totalTokens =
+                output.usage.input + output.usage.output +
+                output.usage.cacheRead + output.usage.cacheWrite;
+            }
+            if (ev.is_error || ev.subtype === "error") {
+              resultError = ev.error ?? ev.result ?? "claude CLI error";
+            }
           }
         }
       });
@@ -299,22 +321,33 @@ function streamClaudeCLI(
         options?.signal?.addEventListener("abort", () => proc.kill("SIGTERM"));
       });
 
-      for (const b of output.content) {
-        delete (b as any)._idx;
-        delete (b as any)._isToolCall;
-        delete (b as any)._toolName;
-        delete (b as any)._inputJson;
+      if (resultError) throw new Error(resultError);
+      const result = parseStructuredOutput(structuredOutput, tools);
+
+      if (result.text) {
+        const contentIndex = output.content.length;
+        output.content.push({ type: "text", text: result.text });
+        stream.push({ type: "text_start", contentIndex, partial: output });
+        stream.push({ type: "text_delta", contentIndex, delta: result.text, partial: output });
+        stream.push({ type: "text_end", contentIndex, content: result.text, partial: output });
       }
 
-      stream.push({ type: "done", reason: "stop", message: output });
+      for (const call of result.toolCalls) {
+        const contentIndex = output.content.length;
+        const block: ToolCall = { ...call, arguments: {} };
+        output.content.push(block);
+        stream.push({ type: "toolcall_start", contentIndex, partial: output });
+        const delta = JSON.stringify(call.arguments);
+        stream.push({ type: "toolcall_delta", contentIndex, delta, partial: output });
+        block.arguments = call.arguments;
+        stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
+      }
+
+      output.stopReason = result.toolCalls.length > 0 ? "toolUse" : "stop";
+      stream.push({ type: "done", reason: output.stopReason, message: output });
       stream.end();
     } catch (error) {
-      for (const b of output.content) {
-        delete (b as any)._idx;
-        delete (b as any)._isToolCall;
-        delete (b as any)._toolName;
-        delete (b as any)._inputJson;
-      }
+      for (const b of output.content) delete (b as any)._idx;
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
       stream.push({ type: "error", reason: output.stopReason, error: output });

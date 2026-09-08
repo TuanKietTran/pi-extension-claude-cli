@@ -28,7 +28,16 @@ Available models: `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-
 
 ## How it works
 
-Spawns `claude -p <prompt> --output-format stream-json` as a subprocess and pipes the streaming events into pi. Tool calls (Bash, Read, Edit, etc.) are executed by the claude subprocess and shown as `▶ ToolName: ...` lines in the pi stream.
+The extension spawns `claude -p <prompt> --output-format stream-json` as a subprocess and pipes its response into Pi.
+
+Pi remains responsible for tools:
+
+- Claude's native tools, plugins, hooks, and MCP servers are disabled for the subprocess.
+- The currently active Pi tools and their schemas are supplied to Claude through a structured-output bridge.
+- Claude's requested calls are emitted as real Pi `ToolCall` blocks.
+- Pi validates and executes each call, emits the normal tool lifecycle events, and returns the result on the next turn.
+
+This means Pi options such as `--tools write` and `--exclude-tools bash` are respected by the `claude-cli` provider. A recent Claude CLI with `--json-schema` and `--safe-mode` support is required.
 
 ## Acknowledgements
 
