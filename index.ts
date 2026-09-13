@@ -318,7 +318,7 @@ function streamClaudeCLI(
       await new Promise<void>((resolve, reject) => {
         proc.on("close", (code) => {
           if (code === 0) resolve();
-          else reject(new Error(`claude exited ${code}: ${stderrBuf.slice(0, 500)}`));
+          else reject(new Error(resultError ?? `claude exited ${code}: ${stderrBuf.slice(0, 500)}`));
         });
         proc.on("error", reject);
         options?.signal?.addEventListener("abort", () => proc.kill("SIGTERM"));
