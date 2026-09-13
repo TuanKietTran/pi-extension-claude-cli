@@ -29,6 +29,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createClaudeStreamInput } from "./media.ts";
 
 function resolveClaudeBin(): string {
   const candidates = [
@@ -205,7 +206,8 @@ function streamClaudeCLI(
       }
 
       const args = [
-        "-p", prompt,
+        "-p",
+        "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--verbose",
@@ -224,6 +226,7 @@ function streamClaudeCLI(
       }
 
       const proc = spawn(CLAUDE_BIN, args, { env: { ...process.env } });
+      proc.stdin.end(createClaudeStreamInput(lastMsg, prompt));
 
       stream.push({ type: "start", partial: output });
 
@@ -410,7 +413,7 @@ export default function (pi: ExtensionAPI) {
         id: "claude-fable-5",
         name: "Claude Fable 5 (CLI)",
         reasoning: true,
-        input: ["text"],
+        input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 64000,
@@ -419,7 +422,7 @@ export default function (pi: ExtensionAPI) {
         id: "claude-opus-5",
         name: "Claude Opus 5 (CLI)",
         reasoning: true,
-        input: ["text"],
+        input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 1000000,
         maxTokens: 128000,
@@ -428,7 +431,7 @@ export default function (pi: ExtensionAPI) {
         id: "claude-opus-4-8",
         name: "Claude Opus 4.8 (CLI)",
         reasoning: true,
-        input: ["text"],
+        input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 32000,
@@ -437,7 +440,7 @@ export default function (pi: ExtensionAPI) {
         id: "claude-sonnet-5",
         name: "Claude Sonnet 5 (CLI)",
         reasoning: true,
-        input: ["text"],
+        input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 64000,
@@ -446,7 +449,7 @@ export default function (pi: ExtensionAPI) {
         id: "claude-sonnet-4-6",
         name: "Claude Sonnet 4.6 (CLI)",
         reasoning: true,
-        input: ["text"],
+        input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 64000,
@@ -455,7 +458,7 @@ export default function (pi: ExtensionAPI) {
         id: "claude-haiku-4-5-20251001",
         name: "Claude Haiku 4.5 (CLI)",
         reasoning: false,
-        input: ["text"],
+        input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 64000,
