@@ -19,17 +19,22 @@ import type {
   Api,
   AssistantMessage,
   AssistantMessageEventStream,
-  Context,
   Message,
   Model,
   SimpleStreamOptions,
   ThinkingContent,
   Tool,
   ToolCall,
+  TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import {
+  createAssistantMessageEventStream,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+} from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createClaudeStreamInput } from "./media.ts";
+import { startMcpServer, type McpHandle } from "./mcp.ts";
 
 function resolveClaudeBin(): string {
   const candidates = [
@@ -55,12 +60,17 @@ function contentText(content: Message["content"]): string {
 function formatMessage(message: Message): string {
   if (message.role === "user") return `Human: ${contentText(message.content)}`;
 
+  if (message.role === "system") return `System: ${contentText(message.content)}`;
+
   if (message.role === "toolResult") {
     const status = message.isError ? "error" : "success";
     return `Tool result (${status}) for ${message.toolName} [${message.toolCallId}]:\n${contentText(message.content)}`;
   }
 
-  const blocks = message.content.flatMap((block) => {
+  const content = message.content;
+  if (typeof content === "string") return `Assistant: ${content}`;
+
+  const blocks = content.flatMap((block) => {
     if (block.type === "text") return block.text.trim() ? [block.text] : [];
     if (block.type === "toolCall") {
       return [`Tool call [${block.id}]: ${block.name}(${JSON.stringify(block.arguments)})`];
@@ -119,11 +129,16 @@ function createToolBridgePrompt(tools: Tool[]): string {
 
   return [
     "<pi_tool_bridge>",
-    "Claude's native tools are disabled. The following tools are provided by the Pi host.",
-    "To call them, return each requested call in tool_calls. Pi executes them after this response and supplies the results in the next turn.",
-    "Do not claim these host tools are unavailable. Do not simulate a tool call in prose.",
-    "When one or more tools are needed, keep text brief and populate tool_calls with exact tool names and schema-valid arguments.",
+    "Claude's native tools are intentionally disabled. This does NOT mean the Pi host tools below are unavailable.",
+    "Use the mcp__pi-host__* tools when they are present. They capture requests for Pi without executing them inside Claude Code.",
+    "If those MCP tools are not present, request Pi host tools by returning entries in the structured output's tool_calls array.",
+    "Pi executes captured or structured requests after this response and supplies successful or failed results in the next turn.",
+    "A tool is available exactly when its name appears below. Never report 'No such tool available' unless a Pi tool result explicitly contains that error.",
+    "If the task requires filesystem or shell access, you MUST request the appropriate listed Pi host tool instead of explaining that tools are disabled.",
+    "Do not simulate a tool call in prose. Use exact tool names and schema-valid arguments; multiple independent calls may be returned together.",
+    "After Pi supplies tool results, continue the task. Request more host tools through tool_calls when needed; otherwise return the final answer in text.",
     "When no tool is needed, return an empty tool_calls array and put the final answer in text.",
+    "Active Pi host tool definitions:",
     JSON.stringify(definitions),
     "</pi_tool_bridge>",
   ].join("\n");
@@ -155,7 +170,7 @@ function parseStructuredOutput(value: unknown, tools: Tool[]): { text: string; t
       type: "toolCall" as const,
       id: `claude_cli_${randomUUID()}`,
       name: call.name,
-      arguments: call.arguments as Record<string, unknown>,
+      arguments: call.arguments as ToolCall["arguments"],
     };
   });
 
@@ -164,7 +179,7 @@ function parseStructuredOutput(value: unknown, tools: Tool[]): { text: string; t
 
 function streamClaudeCLI(
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
@@ -188,22 +203,54 @@ function streamClaudeCLI(
       timestamp: Date.now(),
     };
 
+    let mcp: McpHandle | undefined;
     try {
-      const tools = context.tools ?? [];
-      const messages = context.messages;
+      // Providers receive a normalized transcript: prompt and active tool
+      // declarations live on system messages rather than context fields.
+      const tools = getCurrentTools(context.messages);
+      const systemPrompt = getCurrentSystemPrompt(context.messages);
+      const capturedCalls: ToolCall[] = [];
+      if (tools.length > 0) {
+        mcp = await startMcpServer(
+          "pi-host",
+          tools.map((tool) => ({
+            name: tool.name,
+            description: `${tool.description}\nThis is a Pi host tool. The bridge captures the request; Pi executes it after Claude returns.`,
+            inputSchema: tool.parameters as Record<string, unknown>,
+            handler: (args) => {
+              capturedCalls.push({
+                type: "toolCall",
+                id: `claude_cli_mcp_${randomUUID()}`,
+                name: tool.name,
+                arguments: args,
+              });
+              return "Request captured for execution by the Pi host. Do not report a result yet; finish this turn so Pi can execute it.";
+            },
+          })),
+        );
+      }
+      const messages = context.messages.filter((message) => message.role !== "system");
       const lastMsg = messages[messages.length - 1];
       if (!lastMsg) throw new Error("claude CLI received an empty context");
 
-      const prompt = formatMessage(lastMsg);
+      const basePrompt = formatMessage(lastMsg);
+      const prompt = lastMsg.role === "toolResult"
+        ? [
+            basePrompt,
+            "Continue the task using this result. Do not invoke native tools or claim host tools are unavailable; request any next Pi host call only through the structured tool_calls field.",
+          ].join("\n\n")
+        : basePrompt;
       const history = messages.slice(0, -1);
       const appendParts: string[] = [];
-      if (context.systemPrompt) appendParts.push(context.systemPrompt);
-      appendParts.push(createToolBridgePrompt(tools));
+      if (systemPrompt) appendParts.push(systemPrompt);
       if (history.length > 0) {
         appendParts.push(
           `<conversation_history>\n${buildHistory(history)}\n</conversation_history>`,
         );
       }
+      // Keep bridge instructions last so old conversation text and Claude Code's
+      // disabled native-tool state cannot override the host-tool protocol.
+      appendParts.push(createToolBridgePrompt(tools));
 
       const args = [
         "-p",
@@ -212,11 +259,15 @@ function streamClaudeCLI(
         "--include-partial-messages",
         "--verbose",
         "--model", model.id,
-        "--safe-mode",
+        // Safe mode disables even the explicit capture MCP server. Loading no
+        // user/project/local settings provides the same isolation while
+        // keeping the per-turn --mcp-config available.
+        "--setting-sources", "",
         "--disable-slash-commands",
         "--strict-mcp-config",
-        "--mcp-config", JSON.stringify({ mcpServers: {} }),
+        "--mcp-config", mcp?.configPath ?? JSON.stringify({ mcpServers: {} }),
         "--tools", "",
+        ...(mcp ? ["--allowedTools", ...mcp.allowedTools] : []),
         "--no-session-persistence",
         "--json-schema", JSON.stringify(createOutputSchema(tools)),
         "--append-system-prompt", appendParts.join("\n\n"),
@@ -325,7 +376,13 @@ function streamClaudeCLI(
       });
 
       if (resultError) throw new Error(resultError);
-      const result = parseStructuredOutput(structuredOutput, tools);
+      // Claude Code may call the loopback MCP tools before it produces its
+      // structured final output. Those calls are requests only: emit them as
+      // Pi ToolCall blocks and discard Claude's acknowledgement text. Keep the
+      // structured-output path as a fallback for models that follow it directly.
+      const result = capturedCalls.length > 0
+        ? { text: "", toolCalls: capturedCalls }
+        : parseStructuredOutput(structuredOutput, tools);
 
       if (result.text) {
         const contentIndex = output.content.length;
@@ -355,6 +412,8 @@ function streamClaudeCLI(
       output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
+    } finally {
+      mcp?.close();
     }
   })();
 
@@ -417,6 +476,15 @@ export default function (pi: ExtensionAPI) {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 64000,
+      },
+      {
+        id: "claude-opus-5-5",
+        name: "Claude Opus 5.5 (CLI)",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1000000,
+        maxTokens: 128000,
       },
       {
         id: "claude-opus-5",

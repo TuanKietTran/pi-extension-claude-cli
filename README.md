@@ -33,11 +33,12 @@ The extension spawns `claude -p <prompt> --output-format stream-json` as a subpr
 Pi remains responsible for tools:
 
 - Claude's native tools, plugins, hooks, and MCP servers are disabled for the subprocess.
-- The currently active Pi tools and their schemas are supplied to Claude through a structured-output bridge.
-- Claude's requested calls are emitted as real Pi `ToolCall` blocks.
+- The currently active Pi tools and their schemas are supplied through an authenticated, capture-only loopback MCP bridge, with structured output as a fallback.
+- The MCP bridge records requests but never executes tool implementations; requested calls are emitted as real Pi `ToolCall` blocks.
 - Pi validates and executes each call, emits the normal tool lifecycle events, and returns the result on the next turn.
+- The loopback server uses an ephemeral port and per-turn bearer token, then removes its temporary config when the turn ends.
 
-This means Pi options such as `--tools write` and `--exclude-tools bash` are respected by the `claude-cli` provider. A recent Claude CLI with `--json-schema` and `--safe-mode` support is required.
+This means Pi options such as `--tools write` and `--exclude-tools bash` are respected by the `claude-cli` provider. A recent Claude CLI with `--json-schema`, `--setting-sources`, and streamable HTTP MCP support is required.
 
 ## Acknowledgements
 
