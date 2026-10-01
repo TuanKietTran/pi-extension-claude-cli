@@ -13,6 +13,12 @@ claude auth login
 
 ## Install
 
+This extension ships as the `claude-cli/` submodule of the `pi-agent-extensions`
+bundle, which is the usual way to install it. Develop it here and bump the
+submodule pointer in the bundle afterward.
+
+To install it on its own:
+
 ```sh
 pi install path/to/pi-extension-claude-cli
 ```
