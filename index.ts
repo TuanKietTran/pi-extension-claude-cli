@@ -505,6 +505,15 @@ export default function (pi: ExtensionAPI) {
         maxTokens: 32000,
       },
       {
+        id: "claude-sonnet-5-5",
+        name: "Claude Sonnet 5.5 (CLI)",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200000,
+        maxTokens: 64000,
+      },
+      {
         id: "claude-sonnet-5",
         name: "Claude Sonnet 5 (CLI)",
         reasoning: true,

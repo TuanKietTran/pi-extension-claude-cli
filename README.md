@@ -24,7 +24,7 @@ pi --provider claude-cli "your prompt"
 pi --provider claude-cli --model claude-opus-5 "your prompt"
 ```
 
-Available models: `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
+Available models: `claude-fable-5`, `claude-opus-5-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5-5`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
 
 ## How it works
 
