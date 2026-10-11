@@ -31,7 +31,8 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const CLAUDE_BIN = "/opt/homebrew/bin/claude";
+const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
+const CODEX_BIN = process.env.CODEX_BIN || "codex";
 
 function buildHistory(messages: Message[]): string {
   const parts: string[] = [];
@@ -311,6 +312,115 @@ function streamClaudeCLI(
   return stream;
 }
 
+function streamCodexCLI(
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+
+  (async () => {
+    const output: AssistantMessage = {
+      role: "assistant",
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+
+    try {
+      const messages = context.messages;
+      const last = messages[messages.length - 1];
+      const text = (content: any): string => typeof content === "string"
+        ? content
+        : (content as any[]).filter((c) => c.type === "text").map((c) => c.text).join("\\n");
+      const history = messages.slice(0, -1).map((m) => `${m.role}: ${text(m.content)}`).join("\\n\\n");
+      const prompt = [
+        context.systemPrompt,
+        history ? `<conversation_history>\\n${history}\\n</conversation_history>` : "",
+        text(last.content),
+      ].filter(Boolean).join("\\n\\n");
+
+      // `exec --json` is Codex's non-interactive JSONL interface. --full-auto
+      // gives it the same ability to edit and run code that Claude Code has.
+      const args = [
+        "exec", "--json", "--full-auto", "--skip-git-repo-check",
+        "--cd", process.cwd(), "--model", model.id, prompt,
+      ];
+      const proc = spawn(CODEX_BIN, args, { env: { ...process.env } });
+      stream.push({ type: "start", partial: output });
+      let buf = "";
+      let stderr = "";
+
+      const addText = (value: string) => {
+        if (!value) return;
+        const block = { type: "text" as const, text: value };
+        const index = output.content.length;
+        output.content.push(block);
+        stream.push({ type: "text_start", contentIndex: index, partial: output });
+        stream.push({ type: "text_delta", contentIndex: index, delta: value, partial: output });
+        stream.push({ type: "text_end", contentIndex: index, content: value, partial: output });
+      };
+      const handle = (ev: any) => {
+        const item = ev.item;
+        // Codex currently emits completed agent messages in JSON mode. Accept
+        // updated/delta shapes too, so this keeps working across CLI versions.
+        if (item?.type === "agent_message" || item?.type === "assistant_message") {
+          addText(item.text ?? item.message ?? "");
+        } else if (item?.type === "command_execution") {
+          addText(`▶ Bash: \`${item.command ?? ""}\`\\n\\n`);
+        } else if (item?.type === "file_change" || item?.type === "file_edit") {
+          addText(`▶ Edit: ${item.path ?? item.file_path ?? "file"}\\n\\n`);
+        } else if (ev.type === "item.updated" && typeof ev.delta === "string") {
+          addText(ev.delta);
+        }
+        const u = ev.usage ?? ev.turn?.usage;
+        if (u) {
+          output.usage.input = u.input_tokens ?? u.input ?? output.usage.input;
+          output.usage.output = u.output_tokens ?? u.output ?? output.usage.output;
+          output.usage.totalTokens = output.usage.input + output.usage.output +
+            output.usage.cacheRead + output.usage.cacheWrite;
+        }
+        if (ev.type === "error") throw new Error(ev.message ?? ev.error ?? "codex CLI error");
+      };
+
+      proc.stdout.on("data", (chunk: Buffer) => {
+        buf += chunk.toString();
+        const lines = buf.split("\\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try { handle(JSON.parse(line)); } catch (e) {
+            if (e instanceof Error && e.message.includes("codex CLI error")) throw e;
+          }
+        }
+      });
+      proc.stderr.on("data", (c: Buffer) => { stderr += c.toString(); });
+      await new Promise<void>((resolve, reject) => {
+        proc.on("close", (code) => code === 0 ? resolve() : reject(
+          new Error(`codex exited ${code}: ${stderr.slice(0, 500)}`),
+        ));
+        proc.on("error", reject);
+        options?.signal?.addEventListener("abort", () => proc.kill("SIGTERM"));
+      });
+      stream.push({ type: "done", reason: "stop", message: output });
+      stream.end();
+    } catch (error) {
+      output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+      output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+      stream.push({ type: "error", reason: output.stopReason, error: output });
+      stream.end();
+    }
+  })();
+  return stream;
+}
+
 // Basic companion commands mirroring Claude Code's own /compact, /resume and
 // /memory, adapted to this wrapper. This provider spawns `claude -p` fresh each
 // turn (no persistent claude session), so these operate on pi's session and on
@@ -461,6 +571,42 @@ export default function (pi: ExtensionAPI) {
     ],
 
     streamSimple: streamClaudeCLI,
+  });
+
+  pi.registerProvider("codex-cli", {
+    baseUrl: "https://api.openai.com",
+    apiKey: "codex-cli",
+    api: "codex-cli-api",
+    models: [
+      {
+        id: "gpt-5.6-luna",
+        name: "GPT-5.6 Luna (Codex CLI)",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 272000,
+        maxTokens: 128000,
+      },
+      {
+        id: "gpt-5.5-codex",
+        name: "GPT-5.5 Codex (Codex CLI)",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 272000,
+        maxTokens: 128000,
+      },
+      {
+        id: "gpt-5.4",
+        name: "GPT-5.4 (Codex CLI)",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 272000,
+        maxTokens: 128000,
+      },
+    ],
+    streamSimple: streamCodexCLI,
   });
 
   registerCliCommands(pi);
